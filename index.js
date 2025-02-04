@@ -1,12 +1,17 @@
+require('dotenv').config();  // Load environment variables from .env file
+
 const express = require('express');
-const fs = require('fs');
 const ytdl = require('ytdl-core');
-const path = require('path');
+const AWS = require('aws-sdk');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const port = 3000;
 
-// Endpoint to download video
+// Initialize the S3 client (credentials are automatically loaded from environment variables)
+const s3 = new AWS.S3();
+
+// Endpoint to download video and upload to S3
 app.get('/download-video', (req, res) => {
   const { videoId } = req.query;
 
@@ -14,37 +19,50 @@ app.get('/download-video', (req, res) => {
     return res.status(400).json({ error: 'Video ID is required' });
   }
 
-  // Use videoId as the file name (e.g., "videoId.mp4")
+  // Validate the video ID format (basic check for YouTube video ID pattern)
+  const videoIdRegex = /^[a-zA-Z0-9_-]{11}$/;
+  if (!videoIdRegex.test(videoId)) {
+    return res.status(400).json({ error: 'Invalid YouTube video ID' });
+  }
+
+  // Generate a unique file name for S3
   const fileName = `${videoId}.mp4`;
-  const outputFilePath = path.join(__dirname, fileName);
-
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const videoStream = ytdl(videoUrl, { quality: 'highestvideo', filter: 'videoandaudio' });
-  const fileStream = fs.createWriteStream(outputFilePath);
+  
+  // Set S3 upload parameters
+  const params = {
+    Bucket: 'clipsmart', // Replace with your S3 bucket name
+    Key: `videos/${uuidv4()}-${fileName}`, // Unique file name using UUID
+    Body: ytdl(videoUrl, { quality: 'highestvideo', filter: 'videoandaudio' }), // Streaming video directly to S3
+    ContentType: 'video/mp4',
+  };
 
-  let downloadedBytes = 0;
-  let totalBytes = 0;
+  // Upload video directly from YouTube to S3
+  s3.upload(params, (err, data) => {
+    if (err) {
+      console.error('Error uploading to S3:', err);
+      return res.status(500).json({ error: 'Error uploading to S3' });
+    }
 
-  videoStream.on('response', (response) => {
-    totalBytes = parseInt(response.headers['content-length'], 10);
-  });
+    console.log('File uploaded successfully:', data.Location);
 
-  videoStream.on('data', (chunk) => {
-    downloadedBytes += chunk.length;
-    const progress = (downloadedBytes / totalBytes) * 100;
-    console.log(`Downloading... ${progress.toFixed(2)}%`);
-  });
+    // Generate a presigned URL for the uploaded video
+    const presignedUrlParams = {
+      Bucket: 'clipsmart',
+      Key: data.Key,
+      Expires: 3600, // URL will expire in 1 hour
+    };
 
-  videoStream.pipe(fileStream);
+    // Generate the presigned URL
+    s3.getSignedUrl('getObject', presignedUrlParams, (err, url) => {
+      if (err) {
+        console.error('Error generating presigned URL:', err);
+        return res.status(500).json({ error: 'Error generating presigned URL' });
+      }
 
-  fileStream.on('finish', () => {
-    console.log('Download completed!');
-    res.json({ message: 'Download completed', filePath: outputFilePath });
-  });
-
-  fileStream.on('error', (error) => {
-    console.error('Error writing the file:', error);
-    res.status(500).json({ error: 'An error occurred during the file download' });
+      console.log('Presigned URL generated:', url);
+      res.json({ message: 'File uploaded to S3 successfully', fileUrl: url });
+    });
   });
 });
 
